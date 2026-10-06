@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from .models import ScheduleRequest
 from .times import (
     DstIssue,
+    TimeParseError,
     UnknownTimezoneError,
     get_zone,
     parse_wall_time,
@@ -66,6 +67,8 @@ class Normalized:
     freezes: list[Period]
     resource_capacities: dict[str, int]  # 声明容量的资源 -> 正整数容量（未声明者按 1 处理）
     capacity_periods: dict[str, list[CapacityPeriod]]  # 资源 -> 临时容量时段（按开始时刻排序，互不重叠）
+    pinned_starts: dict[str, int]  # 已确认服务 -> 锁定部署开始时刻（UTC epoch 秒）
+    reference_starts: dict[str, int]  # 给出参考时刻的服务 -> 参考部署开始时刻（UTC epoch 秒）
     max_solve_seconds: float
 
 
@@ -262,6 +265,64 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
         if parsed:
             freezes.append(Period(parsed[0], parsed[1], f"维护冻结：{f.label}"))
 
+    # 8) 排程调整：已确认锁定时刻 / 未确认服务的参考时刻。
+    def parse_instant(raw_start: str, tzname: str, field: str) -> int | None:
+        """解析单个时刻（与候选窗同一套 ISO 8601 / 时区 / DST 规则）。"""
+        try:
+            get_zone(tzname)
+        except UnknownTimezoneError:
+            errors.append({"code": "bad_timezone", "field": f"{field}.timezone",
+                           "message": f"{field}: 未知时区 {tzname!r}"})
+            return None
+        try:
+            dt, issue = parse_wall_time(raw_start, tzname, f"{field}.start")
+        except TimeParseError as exc:
+            errors.append({"code": "bad_time", "field": f"{field}.start",
+                           "message": str(exc)})
+            return None
+        if issue:
+            dst_issues.append(_issue_error(issue))
+            return None
+        return int(dt.timestamp())
+
+    def parse_adjustments(items, field_name: str) -> dict[str, int]:
+        """解析锁定/参考时刻列表：同一列表内同一服务重复列出按 422 拒绝。
+
+        列表内重复的后续项即使时刻非法也不再重复解析（按重复条目忽略）；
+        未知服务、非法时刻照常各自报错。
+        """
+        out: dict[str, int] = {}
+        for i, item in enumerate(items):
+            field = f"{field_name}[{i}]"
+            if not item.service:
+                errors.append({"code": "empty_id", "field": f"{field}.service",
+                               "message": f"{field_name}[{i}]: 服务 id 不能为空"})
+                continue
+            if item.service in out:
+                errors.append({"code": f"duplicate_{field_name}",
+                               "field": field,
+                               "message": f"服务 {item.service} 在 {field_name} 中重复列出"
+                                          "（同一服务只能给出一个时刻）"})
+                continue
+            ts = parse_instant(item.start, item.timezone, field)
+            if ts is None:
+                continue
+            if item.service not in services:
+                errors.append({"code": "unknown_service", "field": field,
+                               "message": f"{field_name} 引用了不存在的服务: {item.service}"})
+                continue
+            out[item.service] = ts
+        return out
+
+    pinned_starts = parse_adjustments(req.pinned_starts, "pinned_starts")
+    reference_starts = parse_adjustments(req.reference_starts, "reference_starts")
+    # 同一服务不得同时列入锁定与参考两类。
+    for sid in sorted(set(pinned_starts) & set(reference_starts)):
+        errors.append({"code": "pinned_and_reference",
+                       "field": "pinned_starts/reference_starts",
+                       "message": f"服务 {sid} 同时列入 pinned_starts 与 reference_starts："
+                                  "已确认锁定的服务不能再给出参考时刻（两类互斥）"})
+
     if dst_issues or errors:
         return None, dst_issues + errors
 
@@ -273,6 +334,8 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
         freezes=freezes,
         resource_capacities=resource_capacities,
         capacity_periods=capacity_periods,
+        pinned_starts=pinned_starts,
+        reference_starts=reference_starts,
         max_solve_seconds=req.max_solve_seconds,
     ), []
 

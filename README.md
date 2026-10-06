@@ -2,6 +2,8 @@
 
 在多时区环境下编排软件发布：给定**服务依赖、候选发布时间窗、团队禁发时段、维护冻结、回滚耗时与共享资源**，
 系统用 Google OR-Tools CP-SAT 求出满足全部约束的可执行排程；无解时返回**阻塞它的约束组合**而不是部分结果。
+排程调整时还可提交**已确认服务的锁定开始时刻**（必须准时部署）与**未确认服务的参考开始时刻**
+（按"偏离服务数 → 偏移总时长 → 尽早发布"三层词典序优化），二者均不豁免任何既有约束。
 
 ## 约束语义
 
@@ -88,6 +90,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     {"resource": "k8s-prod-east", "start": "2026-11-14T01:00", "end": "2026-11-14T02:00",
      "timezone": "UTC", "capacity": 0}
   ],
+  "pinned_starts": [
+    {"service": "payments", "start": "2026-11-13T22:30", "timezone": "Europe/Berlin"}
+  ],
+  "reference_starts": [
+    {"service": "api-gateway", "start": "2026-11-14T07:00", "timezone": "Asia/Shanghai"},
+    {"service": "ledger", "start": "2026-11-13T21:00:00-05:00"}
+  ],
   "max_solve_seconds": 10
 }
 ```
@@ -122,6 +131,99 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - 临时容量导致无解时同样返回 **200、`feasible=false`**，`blockers` 中给出对应的
   资源阻塞组合（基准容量阻塞码为 `resource:<资源名>`，临时时段阻塞码为
   `resource:<资源名>:<时段开始时间戳>`），不返回部分排程。
+
+### 排程调整：已确认锁定时刻与参考开始时刻（本轮新增）
+
+排程调整评审时，调用方可在同一份请求中通过两个**可选**字段提交两类开始时刻：
+
+- `pinned_starts`：**已确认服务**的锁定部署开始时刻。这些服务**必须在指定时刻准时部署**，
+  等式约束带 `lock:<服务ID>` 假设字面量；锁定**不豁免**候选窗、依赖、团队禁发、维护冻结与
+  资源分时容量中的任何一项——部署与回滚占用仍须满足全部既有约束。
+- `reference_starts`：**未确认服务**的参考部署开始时刻。参考时刻**只是优化目标、不是约束**，
+  同样不能豁免任何约束；参考点落在窗外 / 冻结期 / 资源被占满的时刻时，服务照常排不进该点，
+  只在目标函数中计一次"偏离"。
+
+两项的每个元素都是 `{"service": <服务ID>, "start": <ISO 8601>, "timezone"?: <IANA 时区>}`，
+时间写法**完全沿用现有规则**：不带偏移量的墙上时间按 `timezone`（默认 `UTC`）解释并参与
+DST 重复 / 不存在检查；带偏移量的绝对时间（`...Z`、`...+08:00`）无歧义直接通过。
+
+**分层目标（仅当出现 `reference_starts` 时启用）**，按词典序逐层求解：
+
+1. **最小化偏离参考时刻的服务数**——先让尽可能多的服务精确落在参考点上
+   （`|实际开始 − 参考| == 0` 才算命中，早于/晚于一个整数秒都计为偏离）；
+2. 在偏离服务数最少的前提下，**最小化偏移总时长**（各参考服务绝对偏差之和，单位秒）；
+3. 在前两层都最优的前提下，**沿用原"尽早发布"目标**——所有服务部署开始时刻之和最小。
+
+未给参考时刻的服务（含已锁定服务）**只参与第 3 层**。由于是词典序目标，三层都必须在
+`max_solve_seconds` 的**共享时限**内分别证明最优；任一层未能证明最优即返回
+**200、`status: "unknown"`、`schedule: null`**（不输出排程），可增大时限后重试。
+省略 `reference_starts`（或传 `[]`）时退回原有单层"尽早发布"求解，未证明最优的
+FEASIBLE 解仍照常返回，旧行为不变。
+
+**锁定与其他约束冲突**时不返回部分排程，`blockers` 给出的阻塞组合中**必然包含锁定条件**
+`lock:<服务ID>`（与它冲突的候选窗 / 冻结 / 禁发 / 资源容量 / 依赖假设同时出现），放松其中
+任意一项即可重新求解。例如锁定时刻落在维护冻结期内：
+
+```json
+{
+  "feasible": false,
+  "status": "infeasible",
+  "schedule": null,
+  "blockers": [
+    {"code": "lock:a", "message": "服务 A（a）已确认必须在 2026-12-01T03:00:00+00:00 UTC 准时部署（锁定开始时刻不可移动；…）"},
+    {"code": "freeze:维护冻结：封网:a", "message": "…期间服务 A（a）不得部署或处于回滚窗口内"}
+  ]
+}
+```
+
+为使"锁在全部候选窗之外"这类矛盾也能被阻塞核解释，建模时间轴会延伸覆盖每个锁定时刻
+（及其部署+回滚占用结束）；因此锁定时刻无论多远都会得到含 `lock:` 的完整阻塞组合，
+而不是报错或部分排程。
+
+**输入错误按现有 422 格式一次性拒绝**（与其他字段相同的 `errors[].code/field/message` 结构）：
+
+| 情形 | 错误码 | field 示例 |
+|---|---|---|
+| 锁定/参考引用了 `services` 中不存在的服务 | `unknown_service` | `pinned_starts[0]` / `reference_starts[2]` |
+| 同一服务在 `pinned_starts` 中重复出现 | `duplicate_pinned_starts` | `pinned_starts[1]` |
+| 同一服务在 `reference_starts` 中重复出现 | `duplicate_reference_starts` | `reference_starts[1]` |
+| 同一服务同时列入两类（两类互斥） | `pinned_and_reference` | `pinned_starts/reference_starts` |
+| 时间串无法解析 | `bad_time` | `reference_starts[0].start` |
+| 墙上时间 DST 重复 / 不存在 | `dst_ambiguous` / `dst_nonexistent` | `pinned_starts[0].start`（含修正建议） |
+| 未知 IANA 时区 | `bad_timezone` | `reference_starts[0].timezone` |
+
+调用示例（curl）：
+
+```bash
+curl -X POST http://localhost:8000/api/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "services": [
+      {"id":"a","name":"服务 A","timezone":"UTC",
+       "duration_minutes":60,"rollback_minutes":0,"resources":["db"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T08:00:00Z","timezone":"UTC"}]},
+      {"id":"b","name":"服务 B","timezone":"UTC",
+       "duration_minutes":60,"rollback_minutes":0,"resources":["db"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T08:00:00Z","timezone":"UTC"}]}
+    ],
+    "pinned_starts": [
+      {"service":"a","start":"2026-12-01T04:00:00Z"}
+    ],
+    "reference_starts": [
+      {"service":"b","start":"2026-12-01T04:00:00Z"}
+    ]
+  }'
+```
+
+上例中 `a`、`b` 共享容量 1 的 `db` 无法同刻部署：`a` 锁定 04:00 不动，`b` 的参考 04:00
+无法命中，分层目标先保证命中数（`a` 锁定必然命中，`b` 偏离计数为 1），再最小化 `b` 的
+偏移，最后取尽早和——`b` 排在 03:00（紧邻 `a` 之前）。把 `a` 的锁定改到冻结段内，
+则返回含 `lock:a` 的阻塞组合。
+
+`/api/schedule/diff` 的两侧请求体同样可携带这两个字段并各自独立求解：例如 current 无锁定、
+modified 新增 `pinned_starts`，差异会体现在被移动的服务上；modified 一侧锁定冲突
+（infeasible/unknown）或输入错误（422）时，仍只在 `failures.modified` 给出含 `lock:` 条件的
+阻塞组合 / 完整错误列表，`diff` 为 `null`。
 
 时间串支持两种写法：
 

@@ -90,7 +90,7 @@ def build_diff(current: RunOutcome, modified: RunOutcome) -> ScheduleDiffRespons
             }
         elif run.result is not None and not run.result.feasible:
             failures[label] = {
-                "kind": "infeasible",
+                "kind": "infeasible" if run.result.status == "infeasible" else "unknown",
                 "status": run.result.status,
                 "blockers": run.result.blockers or [],
             }

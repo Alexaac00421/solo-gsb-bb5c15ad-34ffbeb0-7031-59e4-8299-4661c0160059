@@ -23,6 +23,7 @@ NoOverlap 自动忽略；求解时把所有字面量加入假设（assumptions�
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -144,6 +145,15 @@ def solve(norm: Normalized) -> SolveResult:
     h0 = min(w.start for s in services.values() for w in s.windows)
     h1 = max(w.end for s in services.values() for w in s.windows)
 
+    # 已确认（锁定）时刻可能落在任何候选窗之外——这本身就是需要阻塞核解释的矛盾。
+    # 因此把建模时间轴延伸到所有锁定时刻（及其占用结束），锁定等式仍作为带假设字面量的
+    # 普通约束参与求解；锁点与窗口/冻结/禁发/资源/依赖冲突时，lock 字面量会与相关
+    # 约束一起进入 sufficient-assumption 阻塞核。
+    H0 = min([h0, *norm.pinned_starts.values()] if norm.pinned_starts else [h0])
+    H1 = h1
+    for sid, pst in norm.pinned_starts.items():
+        H1 = max(H1, pst + services[sid].duration + services[sid].rollback)
+
     # 假设字面量 index -> (code, message)，用于不可行核解释。
     assumption_map: dict[int, tuple[str, str]] = {}
 
@@ -152,14 +162,14 @@ def solve(norm: Normalized) -> SolveResult:
     occupy_iv: dict[str, cp_model.IntervalVar] = {}
 
     for sid, s in services.items():
-        start = m.new_int_var(h0, h1, f"start_{sid}")
+        start = m.new_int_var(H0, H1, f"start_{sid}")
         starts[sid] = start
         deploy_iv[sid] = m.new_fixed_size_interval_var(start, s.duration, f"deploy_{sid}")
         occupy_iv[sid] = m.new_fixed_size_interval_var(
             start, s.duration + s.rollback, f"occupy_{sid}")
-        # 窗口之外的缺口仅在 h0~h1 内部建模，而最后的窗口终点即 h1；因此还须显式保证
-        # 占用区间（含回滚）不越过 h1，否则起点取在 h1 时整段占用会漏到所有窗口之外。
-        m.add(start + s.duration + s.rollback <= h1)
+        # 窗口之外的缺口仅在 H0~H1 内部建模，而最后的窗口终点即 h1；因此还须显式保证
+        # 占用区间（含回滚）不越过 H1，否则起点取在 H1 时整段占用会漏到所有窗口之外。
+        m.add(start + s.duration + s.rollback <= H1)
 
     def new_assumption(code: str, message: str) -> cp_model.IntVar:
         b = m.new_bool_var(f"assm_{code.replace(':', '_')}")
@@ -179,10 +189,21 @@ def solve(norm: Normalized) -> SolveResult:
         """常量轴 [a, a+size) 上的可选固定区间。"""
         return m.new_optional_fixed_size_interval_var(m.new_constant(a), size, lit, name)
 
+    # ---- 已确认服务：必须在锁定时刻准时部署 ----
+    # 锁定是带假设字面量的硬等式：锁点与任何其他约束冲突时，lock 字面量会与相关
+    # 约束字面量一起出现在 sufficient-assumption 阻塞核中；锁定本身不豁免任何约束。
+    for sid, pst in norm.pinned_starts.items():
+        lit = new_assumption(
+            f"lock:{sid}",
+            f"服务 {services[sid].name}（{sid}）已确认必须在 {_iso(pst)} UTC 准时部署"
+            "（锁定开始时刻不可移动；锁定不豁免候选窗、依赖、团队禁发、维护冻结与资源容量约束）",
+        )
+        m.add(starts[sid] == pst).only_enforce_if(lit)
+
     # ---- 候选时间窗：占用区间必须整体落在窗口并集内 ----
     for sid, s in services.items():
         union = _merge_intervals([(w.start, w.end) for w in s.windows])
-        gaps = _complement(union, h0, h1)
+        gaps = _complement(union, H0, H1)
         for g_start, g_end in gaps:
             lit = new_assumption(
                 f"window:{sid}:{g_start}",
@@ -250,11 +271,11 @@ def solve(norm: Normalized) -> SolveResult:
         # 有临时容量时段：把总时间轴按时段边界切分为若干容量恒定的分段，对每个
         # “当时容量 < 占用服务数”的分段约束其内部任意时刻的占用并发数不超过当时容量。
         clipped = sorted(
-            ((max(p.start, h0), min(p.end, h1), p) for p in periods
-             if max(p.start, h0) < min(p.end, h1)),
+            ((max(p.start, H0), min(p.end, H1), p) for p in periods
+             if max(p.start, H0) < min(p.end, H1)),
             key=lambda t: (t[0], t[1]),
         )
-        bounds = sorted({h0, h1} | {a for a, _, _ in clipped} | {b for _, b, _ in clipped})
+        bounds = sorted({H0, H1} | {a for a, _, _ in clipped} | {b for _, b, _ in clipped})
         base_lit: cp_model.IntVar | None = None
         period_lits: dict[int, cp_model.IntVar] = {}
         for a, b in zip(bounds, bounds[1:]):
@@ -276,7 +297,7 @@ def solve(norm: Normalized) -> SolveResult:
                         _period_message(resource, covering, users, services))
                 lit = period_lits[covering.start]
             _add_segment_capacity(m, starts, services, users, a, b, seg_cap, lit,
-                                  h0, h1, f"res_{resource}_{a}")
+                                  H0, H1, f"res_{resource}_{a}")
 
     # ---- 依赖先后 + 最小间隔（线性不等式支持直接挂 literal） ----
     for d in norm.dependencies:
@@ -290,23 +311,41 @@ def solve(norm: Normalized) -> SolveResult:
             starts[d.downstream] >= starts[d.upstream] + up.duration + d.gap
         ).only_enforce_if(lit)
 
-    # ---- 目标：总发布开始时刻尽量早（输出稳定、可复现） ----
-    m.minimize(sum(starts.values()))
+    # ---- 目标 ----
+    # 无参考时刻时沿用原目标：所有服务部署开始时刻之和最小（尽量早、可复现）。
+    # 给出参考时刻时采用三层词典序目标，逐层分别求解且每层都必须证明最优：
+    #   1) 最小化偏离参考时刻的服务数（未给参考时刻的服务不参与本层）；
+    #   2) 在 1) 最优的前提下最小化偏移总时长（秒，早于/晚于均计为绝对偏差）；
+    #   3) 在前两层最优的前提下最小化所有服务部署开始时刻之和（原“尽早发布”目标，
+    #      未给参考时刻的服务只在本层参与）。
+    # 参考时刻仅是优化目标，不构成任何约束：参考点落在窗外/冻结期/被资源占满时
+    # 服务照样排不进该时刻（偏离指标取 1），约束永远不会被豁免。
+    early_expr = sum(starts.values())
 
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = norm.max_solve_seconds
-    solver.parameters.num_search_workers = 8
-    status = solver.solve(m)
+    ref_exprs: dict[str, tuple[cp_model.IntVar, cp_model.IntVar]] = {}
+    if norm.reference_starts:
+        for sid, ref in norm.reference_starts.items():
+            # 参考点本身不受约束，可能远离建模轴（如落在全部候选窗之外）；
+            # 偏差变量上界须覆盖起点域 [H0, H1] 到参考点的最大距离，否则会伪不可行。
+            dev_bound = max(abs(H1 - ref), abs(H0 - ref))
+            dev = m.new_int_var(0, dev_bound, f"refdev_{sid}")
+            m.add_abs_equality(dev, starts[sid] - ref)
+            off = m.new_bool_var(f"refoff_{sid}")
+            m.add(dev >= 1).only_enforce_if(off)
+            m.add(dev == 0).only_enforce_if(off.Not())
+            ref_exprs[sid] = (off, dev)
+        count_expr = sum(off for off, _ in ref_exprs.values())
+        total_dev_expr = sum(dev for _, dev in ref_exprs.values())
 
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return SolveResult(
-            feasible=True,
-            status="optimal" if status == cp_model.OPTIMAL else "feasible",
-            starts={sid: solver.value(v) for sid, v in starts.items()},
-            blockers=None,
-        )
+    def run_solve(deadline: float):
+        # 共享总时限：每层最多用到 deadline 为止；剩余极少时给 10ms 下限，避免 0 时长。
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = max(0.01, deadline - time.monotonic())
+        solver.parameters.num_search_workers = 8
+        status = solver.solve(m)
+        return status, solver
 
-    if status == cp_model.INFEASIBLE:
+    def infeasible_result(solver) -> SolveResult:
         core_literals = solver.sufficient_assumptions_for_infeasibility()
         blockers = []
         if core_literals:
@@ -318,9 +357,72 @@ def solve(norm: Normalized) -> SolveResult:
                         for code, msg in assumption_map.values()]
         return SolveResult(False, "infeasible", None, blockers)
 
+    def unknown_result(layered: bool = False) -> SolveResult:
+        if layered:
+            message = (
+                "求解器在时限内未能证明分层目标（偏离参考时刻的服务数 → "
+                "偏移总时长 → 尽早发布）的最优性，按约定不输出排程；"
+                "可增大 max_solve_seconds 后重试"
+            )
+        else:
+            message = (
+                "求解器在时限内未能判定可行性（未证明最优），"
+                "可增大 max_solve_seconds 后重试"
+            )
+        return SolveResult(
+            False, "unknown", None,
+            [{"code": "solver_unknown", "message": message}],
+        )
+
+    deadline = time.monotonic() + norm.max_solve_seconds
+
+    if not norm.reference_starts:
+        # 原行为：单层“尽早发布”；FEASIBLE（未证明最优）也照常返回。
+        m.minimize(early_expr)
+        status, solver = run_solve(deadline)
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            return SolveResult(
+                feasible=True,
+                status="optimal" if status == cp_model.OPTIMAL else "feasible",
+                starts={sid: solver.value(v) for sid, v in starts.items()},
+                blockers=None,
+            )
+        if status == cp_model.INFEASIBLE:
+            return infeasible_result(solver)
+        return unknown_result()
+
+    # 分层优化：每一层都必须在共享时限内证明 OPTIMAL，否则 unknown（不输出排程）。
+    # 第 1 层：偏离参考时刻的服务数最少。
+    m.minimize(count_expr)
+    status, solver = run_solve(deadline)
+    if status == cp_model.INFEASIBLE:
+        return infeasible_result(solver)
+    if status != cp_model.OPTIMAL:
+        return unknown_result(layered=True)
+    best_count = int(round(solver.objective_value))
+    m.add(count_expr <= best_count)
+
+    # 第 2 层：偏移总时长最短。
+    m.minimize(total_dev_expr)
+    status, solver = run_solve(deadline)
+    if status == cp_model.INFEASIBLE:
+        return infeasible_result(solver)
+    if status != cp_model.OPTIMAL:
+        return unknown_result(layered=True)
+    best_dev = int(round(solver.objective_value))
+    m.add(total_dev_expr <= best_dev)
+
+    # 第 3 层：尽早发布（所有服务开始时刻之和最小）。
+    m.minimize(early_expr)
+    status, solver = run_solve(deadline)
+    if status == cp_model.INFEASIBLE:
+        return infeasible_result(solver)
+    if status != cp_model.OPTIMAL:
+        return unknown_result(layered=True)
+
     return SolveResult(
-        False, "unknown", None,
-        [{"code": "solver_unknown",
-          "message": f"求解器在时限内未能判定可行性（状态 {solver.status_name(status)}），"
-                     "可增大 max_solve_seconds 后重试"}],
+        feasible=True,
+        status="optimal",
+        starts={sid: solver.value(v) for sid, v in starts.items()},
+        blockers=None,
     )

@@ -54,6 +54,20 @@ class CapacityPeriodIn(BaseModel):
     capacity: int = Field(..., description="该时段内的并行容量（非负整数，0 表示该时段不可占用）")
 
 
+class PinnedStartIn(BaseModel):
+    service: str = Field(..., description="已确认（锁定）服务的 ID；必须在指定时刻准时部署")
+    start: str = Field(..., description="已确认的部署开始时刻（ISO 8601；不带偏移量时按时区字段解析，"
+                                        "沿用现有 DST 重复/不存在校验）")
+    timezone: str = Field("UTC", description="start 为不带偏移量的墙上时间时使用的 IANA 时区")
+
+
+class ReferenceStartIn(BaseModel):
+    service: str = Field(..., description="给出参考开始时刻的服务 ID（未确认服务）")
+    start: str = Field(..., description="参考部署开始时刻（仅用于分层优化目标，不豁免候选窗、依赖、"
+                                        "禁发、冻结、资源容量等任何约束）")
+    timezone: str = Field("UTC", description="start 为不带偏移量的墙上时间时使用的 IANA 时区")
+
+
 class ScheduleRequest(BaseModel):
     services: list[ServiceIn]
     dependencies: list[DependencyIn] = Field(default_factory=list)
@@ -68,6 +82,18 @@ class ScheduleRequest(BaseModel):
         default_factory=list,
         description="共享资源的临时容量时段（左闭右开）；时段内在任意时刻占用数不得超过该时段容量"
         "（0 表示不可占用），时段外沿用 resource_capacities，未声明基准容量为 1",
+    )
+    pinned_starts: list[PinnedStartIn] = Field(
+        default_factory=list,
+        description="已确认服务的锁定部署开始时刻：这些服务必须在指定时刻准时部署；"
+        "锁定不豁免候选窗、依赖、团队禁发、维护冻结与资源分时容量等任何约束，"
+        "冲突时 blockers 会返回包含 lock 条件的阻塞组合，不返回部分排程",
+    )
+    reference_starts: list[ReferenceStartIn] = Field(
+        default_factory=list,
+        description="未确认服务的参考部署开始时刻：仅参与分层目标（先最小化偏离参考时刻的服务数，"
+        "再最小化偏移总秒数，最后最小化部署开始时刻之和），不豁免任何约束；"
+        "未给出参考时刻的服务只参与最后一层（尽早发布）目标",
     )
     max_solve_seconds: float = Field(10.0, gt=0, le=60)
 

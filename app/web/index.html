@@ -58,6 +58,7 @@
     <h2>请求（JSON）</h2>
     <div class="btns">
       <button onclick="loadScenario('basic')">示例：跨时区可行排程</button>
+      <button class="secondary" onclick="loadScenario('adjust')">排程调整：锁定+参考时刻</button>
       <button class="secondary" onclick="loadScenario('capacity')">共享资源并行容量</button>
       <button class="secondary" onclick="loadScenario('throttle')">临时限流时段</button>
       <button class="secondary" onclick="loadScenario('dst')">DST 校验示例</button>
@@ -110,6 +111,52 @@ const SCENARIOS = {
     ],
     freezes: [
       {label:"周末封网", start:"2026-11-14T02:00", end:"2026-11-14T03:00", timezone:"UTC"}
+    ]
+  },
+  adjust: {
+    // 排程调整：payments 已确认必须在 22:30 Berlin 锁定部署；其余服务给出参考开始时刻。
+    // 目标分层：① 偏离参考时刻的服务数最少 → ② 偏移总时长最短 → ③ 尽早发布。
+    // 锁定与参考都不豁免候选窗、依赖、禁发、冻结、资源分时容量；冲突时 blockers 含 lock 条件。
+    services: [
+      { id:"api-gateway", name:"API 网关", timezone:"Asia/Shanghai",
+        duration_minutes:30, rollback_minutes:60, resources:["k8s-prod-east"],
+        windows:[
+          {start:"2026-11-14T06:00", end:"2026-11-14T11:00", timezone:"Asia/Shanghai"},
+          {start:"2026-11-15T06:00", end:"2026-11-15T11:00", timezone:"Asia/Shanghai"}
+        ]},
+      { id:"payments", name:"支付服务", timezone:"Europe/Berlin",
+        duration_minutes:45, rollback_minutes:60, resources:["k8s-prod-east","payment-db"],
+        windows:[
+          {start:"2026-11-13T22:00", end:"2026-11-14T05:00", timezone:"Europe/Berlin"}
+        ]},
+      { id:"ledger", name:"账务批处理", timezone:"America/New_York",
+        duration_minutes:60, rollback_minutes:120, resources:["payment-db"],
+        windows:[
+          {start:"2026-11-13T20:00", end:"2026-11-14T23:00", timezone:"America/New_York"}
+        ]}
+    ],
+    dependencies: [
+      {upstream:"payments", downstream:"api-gateway", gap_minutes:30},
+      {upstream:"payments", downstream:"ledger", gap_minutes:60}
+    ],
+    service_teams: [
+      {service:"payments", team:"payment-team"},
+      {service:"ledger", team:"payment-team"}
+    ],
+    team_blackouts: [
+      {team:"payment-team", start:"2026-11-13T23:30", end:"2026-11-14T00:30", timezone:"Europe/Berlin"}
+    ],
+    freezes: [
+      {label:"周末封网", start:"2026-11-14T02:00", end:"2026-11-14T03:00", timezone:"UTC"}
+    ],
+    // 已确认：支付服务锁定 22:30 Berlin（= 21:30 UTC）准时部署
+    pinned_starts: [
+      {service:"payments", start:"2026-11-13T22:30", timezone:"Europe/Berlin"}
+    ],
+    // 未确认服务的参考开始时刻（墙上时间 + 时区；也可写 ...Z / +08:00 绝对时间）
+    reference_starts: [
+      {service:"api-gateway", start:"2026-11-14T07:00", timezone:"Asia/Shanghai"},
+      {service:"ledger", start:"2026-11-13T21:00", timezone:"America/New_York"}
     ]
   },
   capacity: {
