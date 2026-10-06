@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from .models import ScheduleRequest
 from .times import (
     DstIssue,
+    TimeParseError,
     UnknownTimezoneError,
     get_zone,
     parse_wall_time,
@@ -67,6 +68,8 @@ class Normalized:
     resource_capacities: dict[str, int]  # 声明容量的资源 -> 正整数容量（未声明者按 1 处理）
     capacity_periods: dict[str, list[CapacityPeriod]]  # 资源 -> 临时容量时段（按开始时刻排序，互不重叠）
     max_solve_seconds: float
+    locked_starts: dict[str, int]  # service_id -> 必须原时刻部署的 UTC epoch 秒
+    reference_starts: dict[str, int]  # service_id -> 参考开始 UTC epoch 秒（仅作分层目标，不豁免约束）
 
 
 def _iso(ts: int) -> str:
@@ -113,11 +116,18 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
             errors.append({"code": "bad_timezone", "field": f"{field}.timezone",
                            "message": f"{field}: 未知时区 {tzname!r}"})
             return None
-        st, is1 = parse_wall_time(raw_start, tzname, f"{field}.start")
-        en, is2 = parse_wall_time(raw_end, tzname, f"{field}.end")
+        try:
+            st, is1 = parse_wall_time(raw_start, tzname, f"{field}.start")
+            en, is2 = parse_wall_time(raw_end, tzname, f"{field}.end")
+        except TimeParseError as exc:
+            errors.append({"code": "bad_time", "field": field,
+                           "message": str(exc), "suggestions": None})
+            return None
         for iss in (is1, is2):
             if iss:
                 dst_issues.append(_issue_error(iss))
+        if is1 or is2:
+            return None
         a, b = int(st.timestamp()), int(en.timestamp())
         if a >= b:
             errors.append({"code": "bad_interval", "field": field,
@@ -262,6 +272,93 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
         if parsed:
             freezes.append(Period(parsed[0], parsed[1], f"维护冻结：{f.label}"))
 
+    # 8) 排程调整锚点：锁定开始时刻（必须原时刻部署）与参考开始时刻（仅作分层目标）。
+    #    未知服务、同一服务在同一列表重复、同一服务同时列入两类、非法时刻均按 422 拒绝。
+    def parse_anchor(raw, field: str, default_tz: str) -> int | None:
+        tzname = raw.timezone or default_tz
+        try:
+            get_zone(tzname)
+        except UnknownTimezoneError:
+            errors.append({"code": "bad_timezone", "field": f"{field}.timezone",
+                           "message": f"{field}: 未知时区 {tzname!r}",
+                           "suggestions": None})
+            return None
+        try:
+            dt, issue = parse_wall_time(raw.start, tzname, f"{field}.start")
+        except TimeParseError as exc:
+            errors.append({"code": "bad_time", "field": field,
+                           "message": str(exc), "suggestions": None})
+            return None
+        if issue:
+            errors.append(_issue_error(issue))
+            return None
+        return int(dt.timestamp())
+
+    locked_starts: dict[str, int] = {}
+    reference_starts: dict[str, int] = {}
+    lock_idx: dict[str, int] = {}
+    ref_idx: dict[str, int] = {}
+    for i, a in enumerate(req.locked_starts):
+        if a.service in lock_idx:
+            errors.append({
+                "code": "duplicate_locked_start",
+                "field": f"locked_starts[{i}]",
+                "message": f"服务 {a.service} 在 locked_starts 中重复提交"
+                           f"（第 {lock_idx[a.service]} 项与第 {i} 项），同一服务只能有一个已确认时刻",
+                "suggestions": None,
+            })
+            continue
+        lock_idx[a.service] = i
+    for i, a in enumerate(req.reference_starts):
+        if a.service in ref_idx:
+            errors.append({
+                "code": "duplicate_reference_start",
+                "field": f"reference_starts[{i}]",
+                "message": f"服务 {a.service} 在 reference_starts 中重复提交"
+                           f"（第 {ref_idx[a.service]} 项与第 {i} 项），同一服务只能有一个参考时刻",
+                "suggestions": None,
+            })
+            continue
+        ref_idx[a.service] = i
+    overlap_anchor = sorted(set(lock_idx) & set(ref_idx))
+    for sid in overlap_anchor:
+        errors.append({
+            "code": "anchor_in_both_lists",
+            "field": f"locked_starts[{lock_idx[sid]}]",
+            "message": f"服务 {sid} 同时列入 locked_starts 与 reference_starts；"
+                       "已确认时刻的服务不能再给参考时刻（两类互斥）",
+            "suggestions": None,
+        })
+
+    for sid, i in lock_idx.items():
+        if sid in overlap_anchor or sid not in services:
+            continue
+        a = req.locked_starts[i]
+        ts = parse_anchor(a, f"locked_starts[{i}]", services[sid].timezone)
+        if ts is not None:
+            locked_starts[sid] = ts
+    unknown_locks = [sid for sid, i in lock_idx.items()
+                     if sid not in services and sid not in overlap_anchor]
+    for sid in unknown_locks:
+        errors.append({"code": "unknown_service",
+                       "field": f"locked_starts[{lock_idx[sid]}]",
+                       "message": f"locked_starts 引用了不存在的服务: {sid}",
+                       "suggestions": None})
+    for sid, i in ref_idx.items():
+        if sid in overlap_anchor or sid not in services:
+            continue
+        a = req.reference_starts[i]
+        ts = parse_anchor(a, f"reference_starts[{i}]", services[sid].timezone)
+        if ts is not None:
+            reference_starts[sid] = ts
+    unknown_refs = [sid for sid, i in ref_idx.items()
+                    if sid not in services and sid not in overlap_anchor]
+    for sid in unknown_refs:
+        errors.append({"code": "unknown_service",
+                       "field": f"reference_starts[{ref_idx[sid]}]",
+                       "message": f"reference_starts 引用了不存在的服务: {sid}",
+                       "suggestions": None})
+
     if dst_issues or errors:
         return None, dst_issues + errors
 
@@ -274,6 +371,8 @@ def validate_and_normalize(req: ScheduleRequest) -> tuple[Normalized | None, lis
         resource_capacities=resource_capacities,
         capacity_periods=capacity_periods,
         max_solve_seconds=req.max_solve_seconds,
+        locked_starts=locked_starts,
+        reference_starts=reference_starts,
     ), []
 
 

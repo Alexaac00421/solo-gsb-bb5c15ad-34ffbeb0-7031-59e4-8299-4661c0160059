@@ -54,6 +54,15 @@ class CapacityPeriodIn(BaseModel):
     capacity: int = Field(..., description="该时段内的并行容量（非负整数，0 表示该时段不可占用）")
 
 
+class StartAnchorIn(BaseModel):
+    """排程调整时的服务开始时刻锚点（锁定时刻 / 参考时刻共用结构）。"""
+
+    service: str = Field(..., description="服务 ID")
+    start: str = Field(..., description="ISO 8601 部署开始时刻；不带偏移量时按时区字段解析")
+    timezone: str = Field(
+        "", description="不带偏移量的墙上时间所用 IANA 时区；省略时取该服务自身的展示时区")
+
+
 class ScheduleRequest(BaseModel):
     services: list[ServiceIn]
     dependencies: list[DependencyIn] = Field(default_factory=list)
@@ -68,6 +77,17 @@ class ScheduleRequest(BaseModel):
         default_factory=list,
         description="共享资源的临时容量时段（左闭右开）；时段内在任意时刻占用数不得超过该时段容量"
         "（0 表示不可占用），时段外沿用 resource_capacities，未声明基准容量为 1",
+    )
+    locked_starts: list[StartAnchorIn] = Field(
+        default_factory=list,
+        description="排程调整：已确认服务的部署开始时刻，必须原时刻部署（仍受候选窗/依赖/禁发/"
+        "冻结/资源容量约束）；与其他约束冲突时随阻塞组合一并返回",
+    )
+    reference_starts: list[StartAnchorIn] = Field(
+        default_factory=list,
+        description="排程调整：未确认服务的参考开始时刻，仅作为分层优化目标（不豁免任何约束）："
+        "先最小化偏离服务数，再最小化偏移总时长，最后沿用尽早发布目标；"
+        "未给参考时刻的服务只参与最后一层目标",
     )
     max_solve_seconds: float = Field(10.0, gt=0, le=60)
 

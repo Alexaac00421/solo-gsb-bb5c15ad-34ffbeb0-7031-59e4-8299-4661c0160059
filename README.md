@@ -17,6 +17,49 @@
 
 目标函数：所有服务部署开始时刻之和最小（排程尽量早、结果确定可复现）。
 
+## 排程调整：锁定时刻与参考时刻（本轮新增）
+
+评审中需要“固定住几项已确认发布、再重排其余服务”时，可在 `/api/schedule` 请求体顶层追加
+两个**可选**数组（省略或传 `[]` 时行为与旧版本完全一致；`/api/schedule/diff` 两侧请求也各自支持）：
+
+| 字段 | 语义 |
+|---|---|
+| `locked_starts` | **已确认服务**的部署开始时刻，必须**原时刻部署**。锁定不豁免任何约束：其部署与回滚占用仍须满足候选窗、依赖、团队禁发、维护冻结与资源分时容量。锁定与任一其他约束冲突时，阻塞组合（`blockers`）中会包含 `{"code": "locked_start:<服务ID>", ...}` 以及与之冲突的约束，**不返回部分排程**。 |
+| `reference_starts` | **未确认服务**的参考开始时刻，仅作为优化偏好，**不豁免任何约束**（窗外/冻结/资源等约束照常生效，时刻会被排到最近的合法位置）。未给参考时刻的服务只参与最后一层目标。 |
+
+两类锚点的每项写法相同：
+
+```json
+{"service": "payments", "start": "2026-11-13T22:00:00Z", "timezone": "UTC"}
+```
+
+- `start` 沿用现有 ISO 8601 解析规则：带偏移量（`Z` / `+01:00`）时为绝对时刻；
+  不带偏移量时为墙上时间，`timezone` 字段给 IANA 时区（DST 回拨重复/前拨不存在按 422 拒绝，
+  错误格式与候选窗完全一致，且给出可直接修正的绝对时刻建议）；
+- **`timezone` 可省略**：省略时取该服务自身的 `timezone`（展示时区）。
+
+含参考时刻时，对“给了参考时刻的服务”按以下**分层（字典序）目标**求解，三层依次最优：
+
+1. **偏离参考时刻的服务数最少**（开始时刻与参考完全一致才算不偏离，提前/推迟一秒都算偏离）；
+2. 在偏离数最少的前提下，**偏移总时长最少**（各服务绝对偏差秒数之和）；
+3. 在前两层都最优的前提下，**沿用原尽早发布目标**（所有服务部署开始时刻之和最小）。
+
+只有三层都在 `max_solve_seconds` 内**证明最优**才返回 `200、"status": "optimal"` 与排程；
+任一层限时内未能证明最优则返回 `200、feasible=false、"status": "unknown"`，
+`blockers` 为 `solver_unknown`，**不输出排程**（可增大 `max_solve_seconds` 重试）。
+不含参考时刻时求解路径与旧版完全一致（单目标尽早，可行但未证最优时返回 `feasible`）。
+
+输入错误（沿用现有 422 `errors` 数组格式，可与其他错误一并返回）：
+
+| code | 触发条件 |
+|---|---|
+| `unknown_service` | 锚点引用了不存在的服务（`field` 指明 `locked_starts[i]` / `reference_starts[i]`） |
+| `duplicate_locked_start` | 同一服务在 `locked_starts` 中重复出现 |
+| `duplicate_reference_start` | 同一服务在 `reference_starts` 中重复出现 |
+| `anchor_in_both_lists` | 同一服务同时列入两类（已确认与参考互斥） |
+| `bad_time` | 时间串无法按 ISO 8601 解析 |
+| `dst_ambiguous` / `dst_nonexistent` / `bad_timezone` | 墙上时间 DST 歧义/不存在、时区未知（与候选窗同一套格式与建议） |
+
 ## 快速开始（Docker Compose）
 
 ```bash
@@ -87,6 +130,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
   "resource_capacity_periods": [
     {"resource": "k8s-prod-east", "start": "2026-11-14T01:00", "end": "2026-11-14T02:00",
      "timezone": "UTC", "capacity": 0}
+  ],
+  "locked_starts": [
+    {"service": "payments", "start": "2026-11-13T22:00:00+01:00"}
+  ],
+  "reference_starts": [
+    {"service": "api-gateway", "start": "2026-11-13T23:30:00Z"}
   ],
   "max_solve_seconds": 10
 }
@@ -292,6 +341,85 @@ curl -X POST http://localhost:8000/api/schedule \
 }
 ```
 
+#### 排程调整示例：锁定时刻 + 参考时刻（HTTP）
+
+`payments` 已确认在 `02:00 UTC` 发布（锁定）；`api-gateway`、`reports` 尚未确认，
+参考时刻都给 `02:00`。三者串行依赖同一资源 `shared-db`（容量 1，每次部署 + 回滚占用 1 小时）。
+
+```bash
+curl -X POST http://localhost:8000/api/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "services": [
+      {"id":"payments","name":"支付","timezone":"UTC","duration_minutes":30,"rollback_minutes":30,
+       "resources":["shared-db"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T06:00:00Z","timezone":"UTC"}]},
+      {"id":"api-gateway","name":"网关","timezone":"UTC","duration_minutes":30,"rollback_minutes":30,
+       "resources":["shared-db"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T06:00:00Z","timezone":"UTC"}]},
+      {"id":"reports","name":"报表","timezone":"UTC","duration_minutes":30,"rollback_minutes":30,
+       "resources":["shared-db"],
+       "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T06:00:00Z","timezone":"UTC"}]}
+    ],
+    "locked_starts": [
+      {"service":"payments","start":"2026-12-01T02:00:00Z"}
+    ],
+    "reference_starts": [
+      {"service":"api-gateway","start":"2026-12-01T02:00:00Z"},
+      {"service":"reports","start":"2026-12-01T02:00:00Z"}
+    ]
+  }'
+```
+
+分层目标下：`payments` 必须在 `02:00`（占用到 `03:00`），把容量 1 的 `shared-db` 在
+`02:00~03:00` 占满，因此两个未确认服务**都无法**准点于 `02:00`——最少偏离服务数为 **2**；
+第二层把两者各安排到紧贴锁定占用两侧的 `01:00`（提前 1 小时）与 `03:00`（推迟 1 小时），
+偏移总时长最小（2 小时；换成 `03:00`/`04:00` 同为 2 个偏离但总偏移更大）；
+第三层尽早发布同样在等价格局中选总开始时刻更早的组合：
+
+```json
+{
+  "feasible": true,
+  "status": "optimal",
+  "schedule": [
+    {"service_id": "api-gateway", "deploy_start_utc": "2026-12-01T01:00:00+00:00", "...": "…"},
+    {"service_id": "payments",     "deploy_start_utc": "2026-12-01T02:00:00+00:00", "...": "…"},
+    {"service_id": "reports",      "deploy_start_utc": "2026-12-01T03:00:00+00:00", "...": "…"}
+  ],
+  "blockers": null
+}
+```
+
+要点：
+
+- **锁定不豁免约束**：把 `payments` 锁到候选窗外、冻结/禁发时段内，或与资源容量冲突时，
+  返回 `200、feasible=false`，`blockers` 同时包含 `{"code": "locked_start:payments", ...}`
+  与被冲突的约束（如 `resource:shared-db`、`freeze:…`、`dependency:…`），`schedule` 为 `null`。
+- **参考不豁免约束**：参考时刻落在窗外/冻结段时不会报错也不会照排，服务被排到偏差最小的合法时刻。
+- **墙上时间**：`{"service":"payments","start":"2026-12-01T03:00","timezone":"Asia/Shanghai"}`
+  省略 `timezone` 时取服务自身时区；DST 歧义/不存在按 422 拒绝并给出两个绝对时刻修正建议。
+- **输入错误（422）**：未知服务（`unknown_service`）、同服务在同一类重复
+  （`duplicate_locked_start` / `duplicate_reference_start`）、同时列入两类
+  （`anchor_in_both_lists`）、非法时刻（`bad_time`）均沿用 `errors` 数组格式，例如：
+
+```json
+{
+  "errors": [
+    {
+      "code": "anchor_in_both_lists",
+      "field": "locked_starts[0]",
+      "message": "服务 payments 同时列入 locked_starts 与 reference_starts；已确认时刻的服务不能再给参考时刻（两类互斥）",
+      "suggestions": null
+    }
+  ]
+}
+```
+
+- **超时语义**：仅当存在 `reference_starts` 时需要证明三层字典序目标；任一层在
+  `max_solve_seconds` 内未证明最优，返回 `200、feasible=false、status:"unknown"`，
+  不输出排程。`/api/schedule/diff` 两侧请求可以分别携带锚点，锚点导致的 422 / 无解 / unknown
+  仍只在 `failures` 的对应一侧返回，不输出差异。
+
 ### `POST /api/schedule/diff` — 变更影响预演
 
 变更评审时，提交一份**当前排程请求**和一份**修改后的请求**，系统分别独立求解，
@@ -320,6 +448,10 @@ curl -X POST http://localhost:8000/api/schedule \
 - **任一请求输入错误或无解时，不输出差异结果**：在 `failures` 中按 `current` / `modified`
   分别给出该侧的完整输入错误（HTTP 422）或阻塞约束组合（HTTP 200、`feasible=false`），
   与直接调用 `/api/schedule` 得到的内容一致。
+- 两侧请求均可携带本轮新增的 `locked_starts` / `reference_starts` 并独立求解；
+  某侧锚点引用未知服务、重复或跨两类（422），或锁定时刻与该侧约束冲突（`blockers` 含
+  `locked_start:<服务ID>`），或该侧分层目标限时未证明最优（`kind: "unknown"`）时，
+  同样只在 `failures` 的对应一侧给出结果，`diff` 为 `null`，不给部分排程。
 
 调用示例：
 

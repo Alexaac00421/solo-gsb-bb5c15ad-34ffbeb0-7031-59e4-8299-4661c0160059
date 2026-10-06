@@ -23,6 +23,7 @@ NoOverlap 自动忽略；求解时把所有字面量加入假设（assumptions�
 
 from __future__ import annotations
 
+import time as _time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -137,7 +138,13 @@ def _add_segment_capacity(m: cp_model.CpModel, starts, services, users: list[str
     m.add_cumulative(clamped, [1] * len(clamped), cap)
 
 
-def solve(norm: Normalized) -> SolveResult:
+def _build_model(norm: Normalized):
+    """建立全部业务约束。返回模型、决策变量与假设映射。
+
+    排程调整的锁定开始时刻也作为一条可放松假设加入：锁定与其他约束冲突时，
+    不可行核（sufficient assumption core）会包含该锁定条件，随阻塞组合返回，
+    不返回部分排程。参考开始时刻不在此处理（仅作为分层优化目标）。
+    """
     m = cp_model.CpModel()
     services = norm.services
 
@@ -178,6 +185,18 @@ def solve(norm: Normalized) -> SolveResult:
     def opt_constant(a: int, size: int, lit, name: str) -> cp_model.IntervalVar:
         """常量轴 [a, a+size) 上的可选固定区间。"""
         return m.new_optional_fixed_size_interval_var(m.new_constant(a), size, lit, name)
+
+    # ---- 排程调整：已确认服务必须在锁定时刻部署 ----
+    # 锁定时刻可能落在变量域（候选窗并集 [h0,h1]）之外；reified 等式即便常量在域外
+    # 也合法，字面量被假设为真时直接贡献不可行，故锁定条件能随不可行核返回。
+    for sid, locked_at in norm.locked_starts.items():
+        s = services[sid]
+        lit = new_assumption(
+            f"locked_start:{sid}",
+            f"服务 {s.name}（{sid}）的部署开始时刻已确认为 {_iso(locked_at)}，"
+            "必须在该时刻部署；该锁定条件与其他约束冲突",
+        )
+        m.add(starts[sid] == locked_at).only_enforce_if(lit)
 
     # ---- 候选时间窗：占用区间必须整体落在窗口并集内 ----
     for sid, s in services.items():
@@ -290,37 +309,123 @@ def solve(norm: Normalized) -> SolveResult:
             starts[d.downstream] >= starts[d.upstream] + up.duration + d.gap
         ).only_enforce_if(lit)
 
-    # ---- 目标：总发布开始时刻尽量早（输出稳定、可复现） ----
-    m.minimize(sum(starts.values()))
+    return m, starts, assumption_map, h0, h1
 
+
+def _solver(seconds: float) -> cp_model.CpSolver:
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = norm.max_solve_seconds
+    solver.parameters.max_time_in_seconds = seconds
     solver.parameters.num_search_workers = 8
-    status = solver.solve(m)
+    return solver
 
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+
+def _infeasible_result(solver: cp_model.CpSolver,
+                       assumption_map: dict[int, tuple[str, str]]) -> SolveResult:
+    core_literals = solver.sufficient_assumptions_for_infeasibility()
+    blockers = []
+    if core_literals:
+        for lit in core_literals:
+            code, message = assumption_map[lit]
+            blockers.append({"code": code, "message": message})
+    else:
+        blockers = [{"code": code, "message": msg}
+                    for code, msg in assumption_map.values()]
+    return SolveResult(False, "infeasible", None, blockers)
+
+
+_UNKNOWN_OPT_BLOCKER = [
+    {"code": "solver_unknown",
+     "message": "求解器在时限内未能证明分层目标（最小化偏离参考时刻的服务数 → "
+                "最小化偏移总时长 → 尽早发布）的最优性，按 unknown 处理，不输出排程；"
+                "可增大 max_solve_seconds 后重试"}
+]
+
+
+def solve(norm: Normalized) -> SolveResult:
+    m, starts, assumption_map, _h0, _h1 = _build_model(norm)
+    services = norm.services
+
+    # 无参考时刻：沿用原“尽早发布”单层目标。锁定时刻是硬假设，冲突时仍走不可行核。
+    if not norm.reference_starts:
+        m.minimize(sum(starts.values()))
+        solver = _solver(norm.max_solve_seconds)
+        status = solver.solve(m)
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            return SolveResult(
+                feasible=True,
+                status="optimal" if status == cp_model.OPTIMAL else "feasible",
+                starts={sid: solver.value(v) for sid, v in starts.items()},
+                blockers=None,
+            )
+        if status == cp_model.INFEASIBLE:
+            return _infeasible_result(solver, assumption_map)
         return SolveResult(
-            feasible=True,
-            status="optimal" if status == cp_model.OPTIMAL else "feasible",
-            starts={sid: solver.value(v) for sid, v in starts.items()},
-            blockers=None,
+            False, "unknown", None,
+            [{"code": "solver_unknown",
+              "message": f"求解器在时限内未能判定可行性（状态 {solver.status_name(status)}），"
+                         "可增大 max_solve_seconds 后重试"}],
         )
 
-    if status == cp_model.INFEASIBLE:
-        core_literals = solver.sufficient_assumptions_for_infeasibility()
-        blockers = []
-        if core_literals:
-            for lit in core_literals:
-                code, message = assumption_map[lit]
-                blockers.append({"code": code, "message": message})
-        else:
-            blockers = [{"code": code, "message": msg}
-                        for code, msg in assumption_map.values()]
-        return SolveResult(False, "infeasible", None, blockers)
+    # ---- 排程调整：分层（字典序）优化 ----
+    # 0) 仅判可行性（同时取初始解）；
+    # 1) 最小化偏离参考时刻的服务数；
+    # 2) 在服务数最优前提下最小化偏移总时长（绝对偏差秒数之和）；
+    # 3) 在前两层最优前提下最小化所有部署开始时刻之和（原尽早发布目标）。
+    # 每层都必须在时限内证明最优（OPTIMAL）；任一层超时只返回 unknown，不输出排程。
+    refs = norm.reference_starts
+    ref_ids = sorted(refs)
+    span = max(w.end for s in services.values() for w in s.windows) - min(
+        w.start for s in services.values() for w in s.windows)
+    diffs: dict[str, cp_model.IntVar] = {}
+    devs: dict[str, cp_model.IntVar] = {}
+    off: dict[str, cp_model.IntVar] = {}
+    for sid in ref_ids:
+        diffs[sid] = m.new_int_var(-span, span, f"refdiff_{sid}")
+        m.add(diffs[sid] == starts[sid] - refs[sid])
+        devs[sid] = m.new_int_var(0, span, f"refdev_{sid}")
+        m.add_abs_equality(devs[sid], diffs[sid])
+        off[sid] = m.new_bool_var(f"refoff_{sid}")
+        m.add(devs[sid] >= 1).only_enforce_if(off[sid])
+        m.add(devs[sid] == 0).only_enforce_if(off[sid].Not())
+    off_count = sum(off.values())
+    dev_total = sum(devs.values())
+    early = sum(starts.values())
+
+    deadline = _time.monotonic() + norm.max_solve_seconds
+
+    def run_phase(name: str, objective) -> tuple[str, cp_model.CpSolver | None]:
+        m.minimize(objective)
+        solver = _solver(max(0.05, deadline - _time.monotonic()))
+        status = solver.solve(m)
+        if status == cp_model.INFEASIBLE:
+            return "infeasible", solver
+        if status == cp_model.OPTIMAL:
+            # 用当前最优解为下一层热启动。
+            m.clear_hints()
+            for sid, v in starts.items():
+                m.add_hint(v, solver.value(v))
+            return "optimal", solver
+        return "unknown", None
+
+    status_name, solver = run_phase("feasibility", off_count)
+    if status_name == "infeasible":
+        return _infeasible_result(solver, assumption_map)
+    if status_name == "unknown":
+        return SolveResult(False, "unknown", None, _UNKNOWN_OPT_BLOCKER)
+
+    m.add(off_count == solver.value(off_count))
+    status_name, solver = run_phase("dev_total", dev_total)
+    if status_name != "optimal":
+        return SolveResult(False, "unknown", None, _UNKNOWN_OPT_BLOCKER)
+
+    m.add(dev_total == solver.value(dev_total))
+    status_name, solver = run_phase("early", early)
+    if status_name != "optimal":
+        return SolveResult(False, "unknown", None, _UNKNOWN_OPT_BLOCKER)
 
     return SolveResult(
-        False, "unknown", None,
-        [{"code": "solver_unknown",
-          "message": f"求解器在时限内未能判定可行性（状态 {solver.status_name(status)}），"
-                     "可增大 max_solve_seconds 后重试"}],
+        feasible=True,
+        status="optimal",
+        starts={sid: solver.value(v) for sid, v in starts.items()},
+        blockers=None,
     )
